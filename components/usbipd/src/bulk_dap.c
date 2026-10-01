@@ -43,11 +43,45 @@ extern uint32_t dap_process_command_safety(const uint8_t* request, uint8_t* resp
 
 #define BULK_DAP_VID 0x0D28
 #define BULK_DAP_PID 0x0204
-#define BULK_DAP_PACKET_SIZE 512 /* High Speed Bulk packet size */
 #define BULK_DAP_MFR_STR      USBIP_STR_MANUFACTURER
 #define BULK_DAP_PRODUCT_STR  USBIP_STR_PRODUCT_BULK
 #define BULK_DAP_SERIAL_STR   USBIP_STR_SERIAL
 #define BULK_DAP_INTF_STR     USBIP_STR_BULK_INTF
+
+/*
+ * Bus speed reported to the host in OP_REP_DEVLIST / OP_REP_IMPORT. The bulk
+ * max packet size is derived from it instead of being a separate knob: USB 2.0
+ * allows exactly 512 bytes for a high-speed bulk endpoint and at most 64 bytes
+ * for a full-speed one. Hosts that validate the configuration descriptor
+ * against the reported speed reject any other combination.
+ */
+#define BULK_DAP_SPEED USB_SPEED_HIGH
+
+#if BULK_DAP_SPEED == USB_SPEED_HIGH
+#define BULK_DAP_PACKET_SIZE 512
+#elif BULK_DAP_SPEED == USB_SPEED_FULL
+#define BULK_DAP_PACKET_SIZE 64
+#else
+#error "BULK_DAP_SPEED must be USB_SPEED_HIGH or USB_SPEED_FULL."
+#endif
+
+/*
+ * Advertising MS OS 2.0 is what lets Windows bind WinUSB without an INF, so it
+ * is on. Turning it off is the escape hatch for usbip-win2 releases that
+ * mishandle the vendor control request carrying the descriptor set: the host
+ * then reads the set, resets the port and restarts enumeration forever, which
+ * shows up as code 10. 0.9.7.5 is fine; 0.9.8.1 is not. With this off the
+ * device enumerates but needs WinUSB installed by hand (Zadig).
+ */
+#define BULK_DAP_USE_MS_OS_20 1
+
+/* bcdUSB 2.10 is what makes the host ask for the BOS descriptor that carries
+ * the MS OS 2.0 platform capability */
+#if BULK_DAP_USE_MS_OS_20
+#define BULK_DAP_BCD_USB 0x0210
+#else
+#define BULK_DAP_BCD_USB 0x0200
+#endif
 
 /* Compile-time check: BULK_DAP_PACKET_SIZE must not exceed CONFIG_USBIP_URB_DATA_MAX_SIZE */
 #if BULK_DAP_PACKET_SIZE > CONFIG_USBIP_URB_DATA_MAX_SIZE
@@ -58,9 +92,10 @@ extern uint32_t dap_process_command_safety(const uint8_t* request, uint8_t* resp
  * BOS Descriptor - Contains Microsoft OS 2.0 Platform Capability
  *****************************************************************************/
 
+#if BULK_DAP_USE_MS_OS_20
+
 #define MS_OS_20_VENDOR_CODE 0x01
 #define MS_OS_20_SET_LEN 0xA2
-
 static const uint8_t dap_v2_bos_desc[] = {
     /* BOS Descriptor Header */
     0x05,       /* bLength */
@@ -113,6 +148,15 @@ static const uint8_t dap_v2_msos20_desc[] = {
 };
 /* clang-format on */
 
+/* The lengths below are hand written into the byte arrays and are also what the
+ * host is told to expect, so a miscount silently truncates the reply instead of
+ * failing anywhere visible */
+_Static_assert(sizeof(dap_v2_bos_desc) == 33, "BOS wTotalLength disagrees with the array");
+_Static_assert(sizeof(dap_v2_msos20_desc) == MS_OS_20_SET_LEN,
+               "MS OS 2.0 wTotalLength disagrees with the array");
+
+#endif /* BULK_DAP_USE_MS_OS_20 */
+
 /*****************************************************************************
  * USB Descriptors
  *****************************************************************************/
@@ -120,7 +164,7 @@ static const uint8_t dap_v2_msos20_desc[] = {
 static const struct usb_device_descriptor dap_v2_dev_desc = {
     .bLength = USB_DT_DEVICE_SIZE,
     .bDescriptorType = USB_DT_DEVICE,
-    .bcdUSB = 0x0210,     /* USB 2.10 */
+    .bcdUSB = BULK_DAP_BCD_USB,
     .bDeviceClass = 0x00, /* Defined at interface level */
     .bDeviceSubClass = 0x00,
     .bDeviceProtocol = 0x00,
@@ -299,6 +343,7 @@ static int vdap_v2_handle_urb(struct usbip_device_driver* driver,
                         setup->bmRequestType, setup->bRequest, setup->wValue, setup->wIndex,
                         setup->wLength);
 
+#if BULK_DAP_USE_MS_OS_20
                 /* Check if this is a Microsoft OS 2.0 vendor request */
                 if (USB_SETUP_TYPE(setup) == 0x02 && /* Vendor type */
                     USB_SETUP_IS_IN(setup))
@@ -343,6 +388,7 @@ static int vdap_v2_handle_urb(struct usbip_device_driver* driver,
                         }
                     }
                 }
+#endif /* BULK_DAP_USE_MS_OS_20 */
 
                 if (USB_SETUP_IS_IN(setup))
                 {
@@ -350,7 +396,18 @@ static int vdap_v2_handle_urb(struct usbip_device_driver* driver,
                         usb_control_handle_setup(setup, &vdap_v2.ctrl_ctx, data_out, data_len);
                     if (ctrl_ret == USB_CONTROL_STALL)
                     {
+                        LOG_DBG("Control IN stalled: bRequest=0x%02x wValue=0x%04x",
+                                setup->bRequest, setup->wValue);
                         urb_ret->u.ret_submit.status = -EPIPE;
+                        urb_ret->u.ret_submit.actual_length = 0;
+                    }
+                    else if (ctrl_ret == USB_CONTROL_ERROR)
+                    {
+                        /* Reporting a zero length success here makes the host treat the
+                         * descriptor as empty and restart enumeration, so fail explicitly */
+                        LOG_ERR("Control IN failed: bRequest=0x%02x wValue=0x%04x",
+                                setup->bRequest, setup->wValue);
+                        urb_ret->u.ret_submit.status = -ENOMEM;
                         urb_ret->u.ret_submit.actual_length = 0;
                     }
                     else
@@ -563,7 +620,7 @@ static int vdap_v2_init(struct usbip_device_driver* driver)
     strncpy(vdap_v2.udev.busid, "2-2", SYSFS_BUS_ID_SIZE - 1);
     vdap_v2.udev.busnum = 1;
     vdap_v2.udev.devnum = 4;
-    vdap_v2.udev.speed = USB_SPEED_HIGH;
+    vdap_v2.udev.speed = BULK_DAP_SPEED;
     vdap_v2.udev.idVendor = dap_v2_dev_desc.idVendor;
     vdap_v2.udev.idProduct = dap_v2_dev_desc.idProduct;
     vdap_v2.udev.bcdDevice = dap_v2_dev_desc.bcdDevice;
@@ -591,11 +648,15 @@ static int vdap_v2_init(struct usbip_device_driver* driver)
     vdap_v2.ctrl_ctx.string_descs = dap_v2_string_descs;
     vdap_v2.ctrl_ctx.num_strings = 4;
     vdap_v2.ctrl_ctx.num_configs = 1;
+#if BULK_DAP_USE_MS_OS_20
     vdap_v2.ctrl_ctx.bos_desc = dap_v2_bos_desc;
     vdap_v2.ctrl_ctx.bos_desc_len = sizeof(dap_v2_bos_desc);
+#endif
     DAP_Setup();
 
-    LOG_INF("Init (VID=%04x PID=%04x) Bulk mode", BULK_DAP_VID, BULK_DAP_PID);
+    LOG_INF("Init (VID=%04x PID=%04x) Bulk mode, %s speed, %d byte endpoints, MS OS 2.0 %s",
+            BULK_DAP_VID, BULK_DAP_PID, BULK_DAP_SPEED == USB_SPEED_HIGH ? "high" : "full",
+            BULK_DAP_PACKET_SIZE, BULK_DAP_USE_MS_OS_20 ? "on" : "off");
     return 0;
 }
 
